@@ -3,6 +3,11 @@
 .project
 .settings
 .classpath
+logs
+target
+out
+tmp
 */target
 */out
 */logs
+*/tmp
