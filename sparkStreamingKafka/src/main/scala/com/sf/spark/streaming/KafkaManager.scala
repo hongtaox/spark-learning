@@ -1,0 +1,133 @@
+package com.sf.spark.streaming
+
+import com.sf.spark.streaming.KafkaCluster.LeaderOffset
+import kafka.common.TopicAndPartition
+import kafka.message.MessageAndMetadata
+import kafka.serializer.Decoder
+import org.apache.log4j.LogManager
+import org.apache.spark.SparkException
+import org.apache.spark.rdd.RDD
+import org.apache.spark.streaming.StreamingContext
+import org.apache.spark.streaming.dstream.InputDStream
+import org.apache.spark.streaming.kafka.{HasOffsetRanges, KafkaUtils}
+
+import scala.reflect.ClassTag
+
+
+class KafkaManager(val kafkaParams: Map[String, String]) extends Serializable {
+  @transient
+  lazy val logger = LogManager.getLogger(this.getClass)
+  private val kc: KafkaCluster = new KafkaCluster(kafkaParams)
+
+
+  /**
+    * 创建数据流
+    * @param ssc
+    * @param kafkaParams
+    * @param topics
+    * @tparam K
+    * @tparam V
+    * @tparam KD
+    * @tparam VD
+    * @return
+    */
+  def createDirectStream[K: ClassTag, V: ClassTag, KD <: Decoder[K]: ClassTag, VD <: Decoder[V]: ClassTag](
+    ssc: StreamingContext, kafkaParams: Map[String, String], topics: Set[String]): InputDStream[(K, V)] = {
+    val groupId = kafkaParams.get("group.id").get
+    setOrUpdateOffsets(topics, groupId)
+    val messages = {
+      val partitionsE = kc.getPartitions(topics)
+      if (partitionsE.isLeft) throw new SparkException("get kafka partition failed:")
+      val partitions = partitionsE.right.get
+      val consumerOffsetsE = kc.getConsumerOffsets(groupId, partitions)
+      if (consumerOffsetsE.isLeft) throw new SparkException("get kafka consumer offsets failed:")
+      val consumerOffsets = consumerOffsetsE.right.get
+      KafkaUtils.createDirectStream[K, V, KD, VD, (K, V)](
+        ssc, kafkaParams, consumerOffsets, (mmd: MessageAndMetadata[K, V]) => (mmd.key(), mmd.message())
+      )
+    }
+    messages
+  }
+
+  /**
+    * 创建数据流前，根据实际消费情况更新消费offsets
+    * @param topics
+    * @param groupId
+    */
+  private def setOrUpdateOffsets(topics: Set[String], groupId: String): Unit = {
+    topics.foreach(topic => {
+      var hasConsumed = true
+      val partitionsE = kc.getPartitions(Set(topic))
+      if (partitionsE.isLeft) throw new SparkException(s"get kafka partition failed: ${partitionsE.left.get.mkString("\n")}")
+      val partitions: Set[TopicAndPartition] = partitionsE.right.get
+      val consumerOffsetsE = kc.getConsumerOffsets(groupId, partitions)
+      if (consumerOffsetsE.isLeft) hasConsumed = false
+      logger.info("consumerOffsetsE.isLeft: " + consumerOffsetsE.isLeft)
+      if (hasConsumed) {
+        //消费过
+        logger.warn(s"topic: ${topic} 已被consumer group: ${groupId} 消费过, offsets: ${consumerOffsetsE}")
+        /**
+          * 如果zk上保存的offsets已经过时了，即kafka的定时清理策略已经将包含该offsets的文件删除。
+          * 针对这种情况，只要判断一下zk上的consumerOffsets和earliestLeaderOffsets的大小，
+          * 如果consumerOffsets比earliestLeaderOffsets还小的话，说明consumerOffsets已过时,
+          * 这时把consumerOffsets更新为earliestLeaderOffsets
+          */
+        val earliestLeaderOffsetsE = kc.getEarliestLeaderOffsets(partitions)
+        if (earliestLeaderOffsetsE.isLeft) throw new SparkException(s"get earliest offsets failed: ${earliestLeaderOffsetsE.left.get.mkString("\n")}")
+        val earliestLeaderOffsets = earliestLeaderOffsetsE.right.get
+        val consumerOffsets = consumerOffsetsE.right.get
+
+        // 可能只是存在部分分区consumerOffsets过时，所以只更新过时分区的consumerOffsets为earliestLeaderOffsets
+        var offsets: Map[TopicAndPartition, Long] = Map()
+        consumerOffsets.foreach({
+          case (tp, n) =>
+            val earliestLeaderOffset = earliestLeaderOffsets(tp).offset
+            if (n < earliestLeaderOffset){
+              logger.warn(s"consumer group: ${groupId} ,topic: ${topic} ,partition: ${tp.partition} offsets(${n})已经过时，更新为: ${earliestLeaderOffset}")
+              offsets += (tp -> earliestLeaderOffset)
+            }
+        })
+        logger.warn("offsets: " + consumerOffsets)
+        if (!offsets.isEmpty) {
+          kc.setConsumerOffsets(groupId, offsets)
+        }
+      } else {
+        //没有消费过
+        val reset = kafkaParams.get("auto.offset.reset").map(_.toLowerCase)
+        var leaderOffsets: Map[TopicAndPartition, LeaderOffset] = null
+        if (reset == Some("smallest")) {
+          leaderOffsets = kc.getEarliestLeaderOffsets(partitions).right.get
+        } else {
+          leaderOffsets = kc.getLatestLeaderOffsets(partitions).right.get
+        }
+        val offsets = leaderOffsets.map({
+          case (tp, offset) => (tp, offset.offset)
+        })
+        logger.warn("offsets: " + offsets)
+        kc.setConsumerOffsets(groupId, offsets)
+      }
+    })
+  }
+
+  /**
+    * 更新zookeeper上的消费offsets
+    * @param rdd
+    */
+  def updateZKOffsets(rdd: RDD[(String, String)]): Unit = {
+    val groupId = kafkaParams.get("group.id").get
+    val offsetRanges = rdd.asInstanceOf[HasOffsetRanges].offsetRanges
+
+    val offsets: Map[TopicAndPartition, Long] = offsetRanges.map({
+      offsetRange => (TopicAndPartition(offsetRange.topic, offsetRange.partition), offsetRange.untilOffset)
+    }).toMap
+    val either = kc.setConsumerOffsets(groupId, offsets)
+    if(either.isLeft) logger.error(s"Error updating the offset to Kafka cluster: ${either.left.get}")
+
+//    for (offsetRange <- offsetRanges){
+//      val topicAndPartition = TopicAndPartition(offsetRange.topic, offsetRange.partition)
+//      val either = kc.setConsumerOffsets(groupId, Map((topicAndPartition, offsetRange.untilOffset)))
+//      if(either.isLeft) logger.error(s"Error updating the offset to Kafka cluster: ${either.left.get}")
+//    }
+  }
+
+}
